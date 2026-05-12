@@ -75,7 +75,10 @@ npx -y @tencent-weixin/openclaw-weixin-cli@latest install
 ```
 
 The VM setup exposes OpenClaw's bundled Node toolchain in SSH shells, so `node`,
-`npm`, and `npx` are available after `scripts/lima-claw start`.
+`npm`, and `npx` are available after `scripts/lima-claw start`. It also installs
+the Ubuntu Go toolchain plus common build helpers, so `go`, `make`, and a C/C++
+compiler are available in the VM. Go-installed binaries under `$HOME/go/bin` are
+added to the VM shell PATH.
 
 For three concurrent VMs, create one config per instance and vary at least
 `INSTANCE_NAME` and `HOST_PORT`, for example `18789`, `18790`, and `18791`.

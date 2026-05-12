@@ -289,7 +289,7 @@ provision:
     set -euxo pipefail
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y ca-certificates curl git jq procps
+    apt-get install -y ca-certificates curl git jq procps build-essential make pkg-config golang-go
 
 probes:
 - mode: readiness
@@ -299,6 +299,7 @@ probes:
     set -euo pipefail
     command -v curl >/dev/null
     command -v git >/dev/null
+    command -v go >/dev/null
 EOF
 }
 
@@ -369,11 +370,20 @@ refresh_openclaw_node_path() {
   fi
 }
 
+ensure_go_toolchain() {
+  if ! command -v go >/dev/null 2>&1; then
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get update
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y golang-go build-essential make pkg-config
+  fi
+  mkdir -p "\$HOME/go/bin"
+}
+
 if ! command -v openclaw >/dev/null 2>&1; then
   curl -fsSL https://openclaw.ai/install-cli.sh | bash -s -- --no-onboard
   refresh_openclaw_node_path
 fi
 refresh_openclaw_node_path
+ensure_go_toolchain
 
 if command -v npm >/dev/null 2>&1; then
   current_version=""
@@ -416,6 +426,12 @@ if [ -d "\$HOME/.openclaw/bin" ]; then
 fi
 if [ -d "\$HOME/.local/bin" ]; then
   PATH="\$HOME/.local/bin:\$PATH"
+fi
+if [ -d "\$HOME/go/bin" ]; then
+  PATH="\$HOME/go/bin:\$PATH"
+fi
+if [ -d "/usr/local/go/bin" ]; then
+  PATH="/usr/local/go/bin:\$PATH"
 fi
 export PATH
 SHELL
