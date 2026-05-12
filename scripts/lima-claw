@@ -1,0 +1,744 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEFAULT_CONFIG="$ROOT_DIR/lima-claw.env"
+LEGACY_CONFIG="$ROOT_DIR/openclaw-lima.env"
+if [[ -n "${LIMA_CLAW_CONFIG:-}" ]]; then
+  CONFIG_FILE="$LIMA_CLAW_CONFIG"
+elif [[ -n "${OPENCLAW_LIMA_CONFIG:-}" ]]; then
+  CONFIG_FILE="$OPENCLAW_LIMA_CONFIG"
+elif [[ -f "$DEFAULT_CONFIG" ]]; then
+  CONFIG_FILE="$DEFAULT_CONFIG"
+elif [[ -f "$LEGACY_CONFIG" ]]; then
+  CONFIG_FILE="$LEGACY_CONFIG"
+else
+  CONFIG_FILE="$DEFAULT_CONFIG"
+fi
+STATE_ROOT="$ROOT_DIR/.state/lima-claw"
+ENV_DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY:-}"
+ENV_GATEWAY_AUTH_TOKEN="${GATEWAY_AUTH_TOKEN:-}"
+ENV_OPENCLAW_VERSION="${OPENCLAW_VERSION:-latest}"
+TARGET_NAME=""
+
+INSTANCE_NAME="openclaw"
+VM_TYPE="vz"
+ARCH="auto"
+CPUS="2"
+MEMORY="4GiB"
+DISK="30GiB"
+GUEST_PORT="18789"
+HOST_PORT="18789"
+HOST_IP="127.0.0.1"
+DEEPSEEK_API_KEY=""
+DEEPSEEK_MODEL="deepseek/deepseek-v4-flash"
+OPENCLAW_VERSION="latest"
+OPENCLAW_POST_INSTALL_COMMANDS=""
+GATEWAY_AUTH_MODE="none"
+GATEWAY_AUTH_TOKEN=""
+
+usage() {
+  cat <<'EOF'
+Usage:
+  scripts/lima-claw init [--config PATH]
+  scripts/lima-claw list
+  scripts/lima-claw start [name] [--config PATH]
+  scripts/lima-claw resume [name] [--config PATH]
+  scripts/lima-claw status [name] [--config PATH]
+  scripts/lima-claw chat [name] [--config PATH] "message"
+  scripts/lima-claw ssh [name] [--config PATH] [-- command...]
+  scripts/lima-claw stop [name] [--config PATH]
+  scripts/lima-claw destroy [name] [--config PATH]
+  scripts/lima-claw shell [name] [--config PATH]
+
+Environment:
+  LIMA_CLAW_CONFIG      Config path. Defaults to ./lima-claw.env.
+  OPENCLAW_LIMA_CONFIG  Legacy alias for LIMA_CLAW_CONFIG.
+  DEEPSEEK_API_KEY      Used by init when writing the local config.
+  OPENCLAW_VERSION      Used by init. Defaults to latest.
+EOF
+}
+
+log() {
+  printf '[lima-claw] %s\n' "$*" >&2
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+trim() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+strip_matching_quotes() {
+  local value="$1"
+  if [[ ${#value} -ge 2 ]]; then
+    if [[ ${value:0:1} == '"' && ${value: -1} == '"' ]]; then
+      value="${value:1:${#value}-2}"
+    elif [[ ${value:0:1} == "'" && ${value: -1} == "'" ]]; then
+      value="${value:1:${#value}-2}"
+    fi
+  fi
+  printf '%s' "$value"
+}
+
+set_config_value() {
+  local key="$1"
+  local value="$2"
+  case "$key" in
+    INSTANCE_NAME|VM_TYPE|ARCH|CPUS|MEMORY|DISK|GUEST_PORT|HOST_PORT|HOST_IP|DEEPSEEK_API_KEY|DEEPSEEK_MODEL|OPENCLAW_VERSION|OPENCLAW_POST_INSTALL_COMMANDS|GATEWAY_AUTH_MODE|GATEWAY_AUTH_TOKEN)
+      printf -v "$key" '%s' "$value"
+      ;;
+    *)
+      die "unknown config key '$key' in $CONFIG_FILE"
+      ;;
+  esac
+}
+
+load_config() {
+  [[ -f "$CONFIG_FILE" ]] || die "config file not found: $CONFIG_FILE (run: scripts/lima-claw init)"
+
+  local line key value
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    line="$(trim "$line")"
+    [[ -z "$line" || ${line:0:1} == "#" ]] && continue
+    [[ "$line" == *=* ]] || die "invalid config line: $line"
+    key="$(trim "${line%%=*}")"
+    value="$(trim "${line#*=}")"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || die "invalid config key: $key"
+    value="$(strip_matching_quotes "$value")"
+    set_config_value "$key" "$value"
+  done <"$CONFIG_FILE"
+}
+
+load_config_if_present() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    load_config
+  fi
+}
+
+apply_target_name() {
+  if [[ -n "$TARGET_NAME" ]]; then
+    INSTANCE_NAME="$TARGET_NAME"
+  fi
+}
+
+strip_arg_separator() {
+  if [[ ${#REMAINING_ARGS[@]} -gt 0 && "${REMAINING_ARGS[0]}" == "--" ]]; then
+    REMAINING_ARGS=("${REMAINING_ARGS[@]:1}")
+  fi
+}
+
+consume_optional_target() {
+  if [[ ${#REMAINING_ARGS[@]} -gt 0 && "${REMAINING_ARGS[0]}" == "--" ]]; then
+    strip_arg_separator
+    apply_target_name
+    return
+  fi
+  if [[ -z "$TARGET_NAME" && ${#REMAINING_ARGS[@]} -gt 0 ]]; then
+    TARGET_NAME="${REMAINING_ARGS[0]}"
+    REMAINING_ARGS=("${REMAINING_ARGS[@]:1}")
+  fi
+  strip_arg_separator
+  apply_target_name
+}
+
+random_token() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 24
+  else
+    LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48
+    printf '\n'
+  fi
+}
+
+write_initial_config() {
+  [[ -e "$CONFIG_FILE" ]] && die "config already exists: $CONFIG_FILE"
+  mkdir -p "$(dirname "$CONFIG_FILE")"
+  local key="$ENV_DEEPSEEK_API_KEY"
+  local token="${ENV_GATEWAY_AUTH_TOKEN:-$(random_token)}"
+  local version="$ENV_OPENCLAW_VERSION"
+  umask 077
+  cat >"$CONFIG_FILE" <<EOF
+INSTANCE_NAME=openclaw
+VM_TYPE=vz
+ARCH=auto
+CPUS=2
+MEMORY=4GiB
+DISK=30GiB
+
+GUEST_PORT=18789
+HOST_PORT=18789
+HOST_IP=127.0.0.1
+
+DEEPSEEK_API_KEY=$key
+DEEPSEEK_MODEL=deepseek/deepseek-v4-flash
+OPENCLAW_VERSION=$version
+OPENCLAW_POST_INSTALL_COMMANDS=
+
+GATEWAY_AUTH_MODE=none
+GATEWAY_AUTH_TOKEN=$token
+EOF
+  chmod 600 "$CONFIG_FILE"
+  log "wrote $CONFIG_FILE"
+  if [[ -z "$key" ]]; then
+    log "edit DEEPSEEK_API_KEY before running start"
+  fi
+}
+
+default_arch() {
+  case "$(uname -m)" in
+    arm64|aarch64) printf 'aarch64' ;;
+    x86_64|amd64) printf 'x86_64' ;;
+    *) die "cannot infer Lima arch from host architecture: $(uname -m)" ;;
+  esac
+}
+
+validate_instance_name() {
+  [[ "$INSTANCE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "INSTANCE_NAME must contain only letters, numbers, dot, underscore, and dash"
+}
+
+validate_config() {
+  validate_instance_name
+  [[ "$VM_TYPE" =~ ^(vz|qemu)$ ]] || die "VM_TYPE must be vz or qemu"
+  if [[ "$ARCH" == "auto" ]]; then
+    ARCH="$(default_arch)"
+  fi
+  [[ "$ARCH" =~ ^(aarch64|x86_64)$ ]] || die "ARCH must be auto, aarch64, or x86_64"
+  [[ "$CPUS" =~ ^[1-9][0-9]*$ ]] || die "CPUS must be a positive integer"
+  [[ "$MEMORY" =~ ^[1-9][0-9]*(MiB|GiB|MB|GB)$ ]] || die "MEMORY must look like 4GiB"
+  [[ "$DISK" =~ ^[1-9][0-9]*(MiB|GiB|MB|GB)$ ]] || die "DISK must look like 30GiB"
+  [[ "$GUEST_PORT" =~ ^[0-9]+$ && "$GUEST_PORT" -ge 1 && "$GUEST_PORT" -le 65535 ]] || die "GUEST_PORT must be 1-65535"
+  [[ "$HOST_PORT" =~ ^[0-9]+$ && "$HOST_PORT" -ge 1 && "$HOST_PORT" -le 65535 ]] || die "HOST_PORT must be 1-65535"
+  [[ "$HOST_IP" =~ ^[0-9a-fA-F:.]+$ ]] || die "HOST_IP must be an IP address"
+  [[ -n "$DEEPSEEK_API_KEY" ]] || die "DEEPSEEK_API_KEY is empty in $CONFIG_FILE"
+  [[ "$DEEPSEEK_API_KEY" != "sk-REPLACE_ME" ]] || die "DEEPSEEK_API_KEY is still a placeholder"
+  [[ -n "$DEEPSEEK_MODEL" ]] || die "DEEPSEEK_MODEL is empty"
+  [[ -n "$OPENCLAW_VERSION" ]] || die "OPENCLAW_VERSION is empty"
+  [[ "$OPENCLAW_VERSION" =~ ^[A-Za-z0-9._~:-]+$ ]] || die "OPENCLAW_VERSION contains unsupported characters"
+  [[ "$GATEWAY_AUTH_MODE" =~ ^(none|token)$ ]] || die "GATEWAY_AUTH_MODE must be none or token"
+  if [[ "$GATEWAY_AUTH_MODE" == "token" && -z "$GATEWAY_AUTH_TOKEN" ]]; then
+    die "GATEWAY_AUTH_TOKEN is required when GATEWAY_AUTH_MODE=token"
+  fi
+}
+
+json_string() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
+  printf '"%s"' "$value"
+}
+
+shell_quote() {
+  local value="$1"
+  printf "'%s'" "${value//\'/\'\\\'\'}"
+}
+
+instance_state_dir() {
+  printf '%s/%s' "$STATE_ROOT" "$INSTANCE_NAME"
+}
+
+lima_yaml_path() {
+  printf '%s/lima.yaml' "$(instance_state_dir)"
+}
+
+write_lima_yaml() {
+  local dir yaml
+  dir="$(instance_state_dir)"
+  yaml="$(lima_yaml_path)"
+  mkdir -p "$dir"
+  cat >"$yaml" <<EOF
+vmType: "$VM_TYPE"
+arch: "$ARCH"
+cpus: $CPUS
+memory: "$MEMORY"
+disk: "$DISK"
+
+images:
+- location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
+  arch: "x86_64"
+- location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+  arch: "aarch64"
+
+mounts:
+- location: "~"
+  writable: false
+
+portForwards:
+- guestPort: $GUEST_PORT
+  hostPort: $HOST_PORT
+  hostIP: "$HOST_IP"
+
+provision:
+- mode: system
+  script: |
+    #!/usr/bin/env bash
+    set -euxo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y ca-certificates curl git jq procps
+
+probes:
+- mode: readiness
+  description: "basic tools are installed"
+  script: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v curl >/dev/null
+    command -v git >/dev/null
+EOF
+}
+
+limactl_instance_exists() {
+  limactl list "$INSTANCE_NAME" >/dev/null 2>&1
+}
+
+ensure_lima_instance() {
+  need_cmd limactl
+  write_lima_yaml
+  if limactl_instance_exists; then
+    log "using existing Lima instance '$INSTANCE_NAME'"
+  else
+    log "creating Lima instance '$INSTANCE_NAME'"
+    limactl create --name="$INSTANCE_NAME" "$(lima_yaml_path)"
+  fi
+  log "starting Lima instance '$INSTANCE_NAME'"
+  limactl start "$INSTANCE_NAME"
+}
+
+run_guest_script() {
+  limactl shell "$INSTANCE_NAME" -- bash -s
+}
+
+configure_openclaw_guest() {
+  local key_q version_q post_install_q model_json auth_json port workspace_json
+  key_q="$(shell_quote "$DEEPSEEK_API_KEY")"
+  version_q="$(shell_quote "$OPENCLAW_VERSION")"
+  post_install_q="$(shell_quote "$OPENCLAW_POST_INSTALL_COMMANDS")"
+  model_json="$(json_string "$DEEPSEEK_MODEL")"
+  workspace_json="$(json_string "~/.openclaw/workspace")"
+  if [[ "$GATEWAY_AUTH_MODE" == "token" ]]; then
+    auth_json="{\"mode\":\"token\",\"token\":$(json_string "$GATEWAY_AUTH_TOKEN")}"
+  else
+    auth_json="{\"mode\":\"none\"}"
+  fi
+  port="$GUEST_PORT"
+
+  log "installing/configuring OpenClaw inside '$INSTANCE_NAME'"
+  run_guest_script <<EOF
+set -euo pipefail
+export PATH="\$HOME/.openclaw/tools/node-current/bin:\$HOME/.openclaw/bin:\$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+OPENCLAW_VERSION=$version_q
+OPENCLAW_POST_INSTALL_COMMANDS=$post_install_q
+
+refresh_openclaw_node_path() {
+  node_root=""
+  for candidate in "\$HOME"/.openclaw/tools/node-v*; do
+    if [[ -x "\$candidate/bin/node" && -x "\$candidate/bin/npm" && -x "\$candidate/bin/npx" ]]; then
+      node_root="\$candidate"
+    fi
+  done
+  if [[ -n "\$node_root" ]]; then
+    mkdir -p "\$HOME/.local/bin"
+    ln -sfnT "\$node_root" "\$HOME/.openclaw/tools/node-current"
+    ln -sfn "\$node_root/bin/node" "\$HOME/.local/bin/node"
+    ln -sfn "\$node_root/bin/npm" "\$HOME/.local/bin/npm"
+    ln -sfn "\$node_root/bin/npx" "\$HOME/.local/bin/npx"
+    ln -sfn "\$node_root/bin/corepack" "\$HOME/.local/bin/corepack"
+    if command -v sudo >/dev/null 2>&1; then
+      sudo mkdir -p /usr/local/bin
+      sudo ln -sfn "\$node_root/bin/node" /usr/local/bin/node
+      sudo ln -sfn "\$node_root/bin/npm" /usr/local/bin/npm
+      sudo ln -sfn "\$node_root/bin/npx" /usr/local/bin/npx
+      sudo ln -sfn "\$node_root/bin/corepack" /usr/local/bin/corepack
+    fi
+    export PATH="\$node_root/bin:\$HOME/.openclaw/bin:\$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  fi
+}
+
+if ! command -v openclaw >/dev/null 2>&1; then
+  curl -fsSL https://openclaw.ai/install-cli.sh | bash -s -- --no-onboard
+  refresh_openclaw_node_path
+fi
+refresh_openclaw_node_path
+
+if command -v npm >/dev/null 2>&1; then
+  current_version=""
+  if command -v openclaw >/dev/null 2>&1; then
+    current_version="\$(openclaw --version 2>/dev/null | awk '{print \$2}' || true)"
+  fi
+  if [[ "\$OPENCLAW_VERSION" != "latest" && "\$current_version" != "\$OPENCLAW_VERSION" ]]; then
+    npm install --force --prefix "\$HOME/.openclaw" -g "openclaw@\$OPENCLAW_VERSION"
+    export PATH="\$HOME/.openclaw/bin:\$HOME/.local/bin:\$PATH"
+  fi
+elif [[ "\$OPENCLAW_VERSION" != "latest" ]]; then
+  echo "npm is required to install openclaw@\${OPENCLAW_VERSION}" >&2
+  exit 1
+fi
+
+command -v openclaw >/dev/null 2>&1
+mkdir -p "\$HOME/.openclaw" "\$HOME/.openclaw/workspace" "\$HOME/.openclaw/logs" "\$HOME/.openclaw/run"
+chmod 700 "\$HOME/.openclaw"
+refresh_openclaw_node_path
+
+for shell_file in "\$HOME/.profile" "\$HOME/.bashrc"; do
+  touch "\$shell_file"
+  tmp_file="\$(mktemp)"
+  awk '
+    /# openclaw-lima path setup/ { skip = 1; next }
+    /# lima-claw path setup/ { skip = 1; next }
+    skip && /^export PATH$/ { skip = 0; next }
+    !skip { print }
+  ' "\$shell_file" > "\$tmp_file"
+  cat "\$tmp_file" > "\$shell_file"
+  rm -f "\$tmp_file"
+  cat >> "\$shell_file" <<'SHELL'
+
+# lima-claw path setup
+if [ -d "\$HOME/.openclaw/tools/node-current/bin" ]; then
+  PATH="\$HOME/.openclaw/tools/node-current/bin:\$PATH"
+fi
+if [ -d "\$HOME/.openclaw/bin" ]; then
+  PATH="\$HOME/.openclaw/bin:\$PATH"
+fi
+if [ -d "\$HOME/.local/bin" ]; then
+  PATH="\$HOME/.local/bin:\$PATH"
+fi
+export PATH
+SHELL
+done
+
+DEEPSEEK_API_KEY=$key_q
+umask 077
+printf 'DEEPSEEK_API_KEY=%q\n' "\$DEEPSEEK_API_KEY" > "\$HOME/.openclaw/.env"
+
+cat > "\$HOME/.openclaw/openclaw.json" <<'JSON'
+{
+  "agents": {
+    "defaults": {
+      "workspace": $workspace_json,
+      "model": {
+        "primary": $model_json
+      }
+    }
+  },
+  "gateway": {
+    "mode": "local",
+    "port": $port,
+    "bind": "loopback",
+    "auth": $auth_json,
+    "http": {
+      "endpoints": {
+        "chatCompletions": { "enabled": true },
+        "responses": { "enabled": true }
+      }
+    }
+  },
+  "models": {
+    "pricing": { "enabled": false }
+  }
+}
+JSON
+
+openclaw --version
+
+if [[ -n "\$OPENCLAW_POST_INSTALL_COMMANDS" ]]; then
+  command -v npx >/dev/null 2>&1 || {
+    echo "npx is required for OPENCLAW_POST_INSTALL_COMMANDS" >&2
+    exit 1
+  }
+  setup_hash="\$(printf '%s' "\$OPENCLAW_POST_INSTALL_COMMANDS" | sha256sum | awk '{print \$1}')"
+  setup_marker="\$HOME/.openclaw/run/post-install-\$setup_hash.done"
+  if [[ ! -e "\$setup_marker" ]]; then
+    bash -lc "\$OPENCLAW_POST_INSTALL_COMMANDS"
+    touch "\$setup_marker"
+  fi
+fi
+EOF
+}
+
+start_openclaw_guest() {
+  local port="$GUEST_PORT"
+  log "starting OpenClaw gateway inside '$INSTANCE_NAME'"
+  run_guest_script <<EOF
+set -euo pipefail
+export PATH="\$HOME/.openclaw/tools/node-current/bin:\$HOME/.openclaw/bin:\$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+set -a
+. "\$HOME/.openclaw/.env"
+set +a
+
+mkdir -p "\$HOME/.openclaw/logs" "\$HOME/.openclaw/run"
+pid_file="\$HOME/.openclaw/run/gateway-$port.pid"
+if [[ -s "\$pid_file" ]] && kill -0 "\$(cat "\$pid_file")" 2>/dev/null; then
+  old_pid="\$(cat "\$pid_file")"
+  kill "\$old_pid"
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 "\$old_pid" 2>/dev/null || break
+    sleep 1
+  done
+fi
+
+nohup openclaw gateway --port "$port" --verbose >"\$HOME/.openclaw/logs/gateway-$port.log" 2>&1 &
+printf '%s\n' "\$!" > "\$pid_file"
+EOF
+}
+
+host_url() {
+  printf 'http://%s:%s' "$HOST_IP" "$HOST_PORT"
+}
+
+wait_for_http() {
+  need_cmd curl
+  local url="$1"
+  local label="$2"
+  local deadline=$((SECONDS + 180))
+  until curl -fsS "$url" >/dev/null 2>&1; do
+    if (( SECONDS >= deadline )); then
+      die "timed out waiting for $label at $url"
+    fi
+    sleep 2
+  done
+}
+
+start_all() {
+  load_config
+  consume_optional_target
+  validate_config
+  ensure_lima_instance
+  configure_openclaw_guest
+  start_openclaw_guest
+  local base
+  base="$(host_url)"
+  log "waiting for gateway health at $base"
+  wait_for_http "$base/healthz" "gateway health"
+  wait_for_http "$base/readyz" "gateway readiness"
+  log "OpenClaw gateway is ready: $base/"
+}
+
+resume_vm() {
+  load_config
+  consume_optional_target
+  validate_config
+  need_cmd limactl
+  limactl_instance_exists || die "Lima instance '$INSTANCE_NAME' does not exist"
+  log "resuming Lima instance '$INSTANCE_NAME'"
+  limactl start "$INSTANCE_NAME"
+  configure_openclaw_guest
+  start_openclaw_guest
+  local base
+  base="$(host_url)"
+  log "waiting for gateway health at $base"
+  wait_for_http "$base/healthz" "gateway health"
+  wait_for_http "$base/readyz" "gateway readiness"
+  log "OpenClaw gateway is ready: $base/"
+}
+
+status_all() {
+  load_config
+  consume_optional_target
+  validate_config
+  limactl list "$INSTANCE_NAME"
+  local base
+  base="$(host_url)"
+  printf '\nhealthz: '
+  curl -fsS "$base/healthz" || true
+  printf '\nreadyz: '
+  curl -fsS "$base/readyz" || true
+  printf '\n'
+}
+
+list_vms() {
+  need_cmd limactl
+  limactl list
+}
+
+json_escape_for_payload() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
+  printf '%s' "$value"
+}
+
+chat_once() {
+  load_config
+  if [[ -z "$TARGET_NAME" && ${#REMAINING_ARGS[@]} -gt 1 ]]; then
+    TARGET_NAME="${REMAINING_ARGS[0]}"
+    REMAINING_ARGS=("${REMAINING_ARGS[@]:1}")
+  fi
+  apply_target_name
+  validate_config
+  need_cmd curl
+  local message="${REMAINING_ARGS[*]:-}"
+  [[ -n "$message" ]] || die "chat requires a message"
+  local base payload message_json
+  base="$(host_url)"
+  message_json="$(json_escape_for_payload "$message")"
+  payload="{\"model\":\"openclaw\",\"messages\":[{\"role\":\"user\",\"content\":\"$message_json\"}],\"stream\":false}"
+  if [[ "$GATEWAY_AUTH_MODE" == "token" ]]; then
+    curl -fsS -X POST "$base/v1/chat/completions" \
+      -H 'Content-Type: application/json' \
+      -H "Authorization: Bearer $GATEWAY_AUTH_TOKEN" \
+      --data "$payload"
+  else
+    curl -fsS -X POST "$base/v1/chat/completions" \
+      -H 'Content-Type: application/json' \
+      --data "$payload"
+  fi
+  printf '\n'
+}
+
+stop_all() {
+  load_config_if_present
+  consume_optional_target
+  validate_instance_name
+  need_cmd limactl
+  if limactl_instance_exists; then
+    log "stopping OpenClaw gateway process inside '$INSTANCE_NAME' if this script started it"
+    run_guest_script <<EOF || true
+set -euo pipefail
+pid_file="\$HOME/.openclaw/run/gateway-$GUEST_PORT.pid"
+if [[ -s "\$pid_file" ]] && kill -0 "\$(cat "\$pid_file")" 2>/dev/null; then
+  kill "\$(cat "\$pid_file")"
+fi
+EOF
+    log "stopping Lima instance '$INSTANCE_NAME'"
+    limactl stop "$INSTANCE_NAME"
+  else
+    log "Lima instance '$INSTANCE_NAME' does not exist"
+  fi
+}
+
+destroy_all() {
+  load_config_if_present
+  consume_optional_target
+  validate_instance_name
+  need_cmd limactl
+  if limactl_instance_exists; then
+    log "stopping Lima instance '$INSTANCE_NAME'"
+    limactl stop "$INSTANCE_NAME" >/dev/null 2>&1 || true
+    log "deleting Lima instance '$INSTANCE_NAME'"
+    limactl delete --force "$INSTANCE_NAME"
+  else
+    log "Lima instance '$INSTANCE_NAME' does not exist"
+  fi
+  log "removing generated state for '$INSTANCE_NAME'"
+  rm -rf "$(instance_state_dir)"
+}
+
+ssh_into_vm() {
+  load_config_if_present
+  consume_optional_target
+  validate_instance_name
+  need_cmd ssh
+  if [[ ${#REMAINING_ARGS[@]} -gt 0 ]]; then
+    exec ssh -F "$HOME/.lima/$INSTANCE_NAME/ssh.config" "lima-$INSTANCE_NAME" "${REMAINING_ARGS[@]}"
+  else
+    exec ssh -F "$HOME/.lima/$INSTANCE_NAME/ssh.config" "lima-$INSTANCE_NAME"
+  fi
+}
+
+open_shell() {
+  load_config_if_present
+  consume_optional_target
+  validate_instance_name
+  limactl shell "$INSTANCE_NAME"
+}
+
+parse_args() {
+  COMMAND="${1:-start}"
+  if [[ $# -gt 0 ]]; then
+    shift
+  fi
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --config)
+        [[ $# -ge 2 ]] || die "--config needs a path"
+        CONFIG_FILE="$2"
+        shift 2
+        ;;
+      --name|-n)
+        [[ $# -ge 2 ]] || die "--name needs a VM name"
+        TARGET_NAME="$2"
+        shift 2
+        ;;
+      --)
+        REMAINING_ARGS+=("--")
+        shift
+        while [[ $# -gt 0 ]]; do
+          REMAINING_ARGS+=("$1")
+          shift
+        done
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        REMAINING_ARGS+=("$1")
+        shift
+        ;;
+    esac
+  done
+}
+
+main() {
+  REMAINING_ARGS=()
+  parse_args "$@"
+  case "$COMMAND" in
+    init)
+      write_initial_config
+      ;;
+    list)
+      list_vms
+      ;;
+    start)
+      start_all
+      ;;
+    resume)
+      resume_vm
+      ;;
+    status)
+      status_all
+      ;;
+    chat)
+      chat_once
+      ;;
+    ssh)
+      ssh_into_vm
+      ;;
+    stop)
+      stop_all
+      ;;
+    destroy)
+      destroy_all
+      ;;
+    shell)
+      open_shell
+      ;;
+    -h|--help|help)
+      usage
+      ;;
+    *)
+      usage
+      die "unknown command: $COMMAND"
+      ;;
+  esac
+}
+
+main "$@"
