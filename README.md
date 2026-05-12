@@ -49,11 +49,25 @@ INSTANCE_NAME=openclaw
 CPUS=2
 MEMORY=4GiB
 DISK=30GiB
+WORKSPACE_MOUNT=.
+WORKSPACE_MOUNT_WRITABLE=false
 GUEST_PORT=18789
 HOST_PORT=18789
 DEEPSEEK_MODEL=deepseek/deepseek-v4-flash
 OPENCLAW_VERSION=latest
 OPENCLAW_POST_INSTALL_COMMANDS=
+```
+
+By default the VM mounts only the repo directory, not your whole macOS home
+directory. Keep `WORKSPACE_MOUNT_WRITABLE=false` unless you explicitly want the
+VM to be able to edit the mounted host path.
+
+Lima instance shape is fixed at creation time. If you change VM-level settings
+such as CPU, memory, disk, mount, or forwarded ports for an existing VM, run:
+
+```bash
+scripts/lima-claw destroy openclaw
+scripts/lima-claw start openclaw
 ```
 
 `OPENCLAW_POST_INSTALL_COMMANDS` runs inside the VM after Node/OpenClaw are
