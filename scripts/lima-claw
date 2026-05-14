@@ -47,6 +47,7 @@ Usage:
   scripts/lima-claw start [name] [--config PATH]
   scripts/lima-claw resume [name] [--config PATH]
   scripts/lima-claw restart [name] [--config PATH]
+  scripts/lima-claw health [name] [--config PATH]
   scripts/lima-claw status [name] [--config PATH]
   scripts/lima-claw chat [name] [--config PATH] "message"
   scripts/lima-claw ssh [name] [--config PATH] [-- command...]
@@ -608,6 +609,19 @@ wait_for_gateway() {
   log "OpenClaw gateway is ready: $base/"
 }
 
+print_http_check() {
+  local label="$1"
+  local url="$2"
+  local response
+  printf '%s: ' "$label"
+  if response="$(curl -fsS "$url")"; then
+    printf '%s\n' "$response"
+  else
+    printf '\n'
+    die "$label check failed at $url"
+  fi
+}
+
 start_all() {
   load_config
   consume_optional_target
@@ -641,6 +655,18 @@ restart_openclaw() {
   configure_openclaw_guest
   start_openclaw_guest
   wait_for_gateway
+}
+
+health_openclaw() {
+  load_config
+  consume_optional_target
+  validate_config
+  need_cmd curl
+  local base
+  base="$(host_url)"
+  log "checking OpenClaw gateway at $base"
+  print_http_check "healthz" "$base/healthz"
+  print_http_check "readyz" "$base/readyz"
 }
 
 status_all() {
@@ -816,6 +842,9 @@ main() {
       ;;
     restart)
       restart_openclaw
+      ;;
+    health)
+      health_openclaw
       ;;
     status)
       status_all

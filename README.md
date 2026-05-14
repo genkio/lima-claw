@@ -104,6 +104,7 @@ scripts/lima-claw list                  # show Lima VMs
 scripts/lima-claw start [name]          # create/start VM, configure OpenClaw, wait for /readyz
 scripts/lima-claw resume [name]         # start an existing stopped VM and gateway
 scripts/lima-claw restart [name]        # restart the OpenClaw gateway in a running VM
+scripts/lima-claw health [name]         # check gateway /healthz and /readyz
 scripts/lima-claw status [name]         # show Lima status plus /healthz and /readyz
 scripts/lima-claw chat [name] "hello"   # send one OpenAI-compatible HTTP chat request
 scripts/lima-claw ssh [name]            # SSH into the VM
