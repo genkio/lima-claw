@@ -46,6 +46,7 @@ Usage:
   scripts/lima-claw list
   scripts/lima-claw start [name] [--config PATH]
   scripts/lima-claw resume [name] [--config PATH]
+  scripts/lima-claw restart [name] [--config PATH]
   scripts/lima-claw status [name] [--config PATH]
   scripts/lima-claw chat [name] [--config PATH] "message"
   scripts/lima-claw ssh [name] [--config PATH] [-- command...]
@@ -364,6 +365,13 @@ limactl_instance_exists() {
   limactl list "$INSTANCE_NAME" >/dev/null 2>&1
 }
 
+ensure_lima_instance_reachable() {
+  limactl_instance_exists || die "Lima instance '$INSTANCE_NAME' does not exist"
+  if ! limactl shell "$INSTANCE_NAME" -- true >/dev/null 2>&1; then
+    die "Lima instance '$INSTANCE_NAME' is not running or reachable; run 'scripts/lima-claw resume $INSTANCE_NAME'"
+  fi
+}
+
 ensure_lima_instance() {
   need_cmd limactl
   write_lima_yaml
@@ -591,6 +599,15 @@ wait_for_http() {
   done
 }
 
+wait_for_gateway() {
+  local base
+  base="$(host_url)"
+  log "waiting for gateway health at $base"
+  wait_for_http "$base/healthz" "gateway health"
+  wait_for_http "$base/readyz" "gateway readiness"
+  log "OpenClaw gateway is ready: $base/"
+}
+
 start_all() {
   load_config
   consume_optional_target
@@ -598,12 +615,7 @@ start_all() {
   ensure_lima_instance
   configure_openclaw_guest
   start_openclaw_guest
-  local base
-  base="$(host_url)"
-  log "waiting for gateway health at $base"
-  wait_for_http "$base/healthz" "gateway health"
-  wait_for_http "$base/readyz" "gateway readiness"
-  log "OpenClaw gateway is ready: $base/"
+  wait_for_gateway
 }
 
 resume_vm() {
@@ -616,12 +628,19 @@ resume_vm() {
   limactl start "$INSTANCE_NAME"
   configure_openclaw_guest
   start_openclaw_guest
-  local base
-  base="$(host_url)"
-  log "waiting for gateway health at $base"
-  wait_for_http "$base/healthz" "gateway health"
-  wait_for_http "$base/readyz" "gateway readiness"
-  log "OpenClaw gateway is ready: $base/"
+  wait_for_gateway
+}
+
+restart_openclaw() {
+  load_config
+  consume_optional_target
+  validate_config
+  need_cmd limactl
+  ensure_lima_instance_reachable
+  log "restarting OpenClaw gateway inside '$INSTANCE_NAME'"
+  configure_openclaw_guest
+  start_openclaw_guest
+  wait_for_gateway
 }
 
 status_all() {
@@ -794,6 +813,9 @@ main() {
       ;;
     resume)
       resume_vm
+      ;;
+    restart)
+      restart_openclaw
       ;;
     status)
       status_all
