@@ -27,6 +27,7 @@ ARCH="auto"
 CPUS="2"
 MEMORY="4GiB"
 DISK="30GiB"
+SWAP_SIZE=""
 WORKSPACE_MOUNT="$ROOT_DIR"
 WORKSPACE_MOUNT_WRITABLE="false"
 GUEST_PORT="18789"
@@ -99,7 +100,7 @@ set_config_value() {
   local key="$1"
   local value="$2"
   case "$key" in
-    INSTANCE_NAME|VM_TYPE|ARCH|CPUS|MEMORY|DISK|WORKSPACE_MOUNT|WORKSPACE_MOUNT_WRITABLE|GUEST_PORT|HOST_PORT|HOST_IP|DEEPSEEK_API_KEY|DEEPSEEK_MODEL|OPENCLAW_VERSION|OPENCLAW_POST_INSTALL_COMMANDS|GATEWAY_AUTH_MODE|GATEWAY_AUTH_TOKEN)
+    INSTANCE_NAME|VM_TYPE|ARCH|CPUS|MEMORY|DISK|SWAP_SIZE|WORKSPACE_MOUNT|WORKSPACE_MOUNT_WRITABLE|GUEST_PORT|HOST_PORT|HOST_IP|DEEPSEEK_API_KEY|DEEPSEEK_MODEL|OPENCLAW_VERSION|OPENCLAW_POST_INSTALL_COMMANDS|GATEWAY_AUTH_MODE|GATEWAY_AUTH_TOKEN)
       printf -v "$key" '%s' "$value"
       ;;
     *)
@@ -192,7 +193,8 @@ write_initial_config() {
       'ARCH=auto' \
       'CPUS=2' \
       'MEMORY=4GiB' \
-      'DISK=30GiB'
+      'DISK=30GiB' \
+      'SWAP_SIZE=2GiB'
     printf 'WORKSPACE_MOUNT=%s\n' "$ROOT_DIR"
     printf '%s\n' \
       'WORKSPACE_MOUNT_WRITABLE=false' \
@@ -257,6 +259,7 @@ validate_config() {
   [[ "$ARCH" =~ ^(aarch64|x86_64)$ ]] || die "ARCH must be auto, aarch64, or x86_64"
   [[ "$CPUS" =~ ^[1-9][0-9]*$ ]] || die "CPUS must be a positive integer"
   [[ "$MEMORY" =~ ^[1-9][0-9]*(MiB|GiB|MB|GB)$ ]] || die "MEMORY must look like 4GiB"
+  [[ -z "$SWAP_SIZE" || "$SWAP_SIZE" =~ ^[1-9][0-9]*(MiB|GiB|MB|GB)$ ]] || die "SWAP_SIZE must look like 2GiB or be empty"
   [[ "$DISK" =~ ^[1-9][0-9]*(MiB|GiB|MB|GB)$ ]] || die "DISK must look like 30GiB"
   normalize_workspace_mount
   [[ -n "$WORKSPACE_MOUNT" ]] || die "WORKSPACE_MOUNT is empty"
@@ -391,10 +394,11 @@ run_guest_script() {
 }
 
 configure_openclaw_guest() {
-  local key_q version_q post_install_q model_json model_json_q auth_json auth_json_q port
+  local key_q version_q post_install_q swap_q model_json model_json_q auth_json auth_json_q port
   key_q="$(shell_quote "$DEEPSEEK_API_KEY")"
   version_q="$(shell_quote "$OPENCLAW_VERSION")"
   post_install_q="$(shell_quote "$OPENCLAW_POST_INSTALL_COMMANDS")"
+  swap_q="$(shell_quote "$SWAP_SIZE")"
   model_json="$(json_string "$DEEPSEEK_MODEL")"
   model_json_q="$(shell_quote "$model_json")"
   if [[ "$GATEWAY_AUTH_MODE" == "token" ]]; then
@@ -411,6 +415,7 @@ set -euo pipefail
 export PATH="\$HOME/.openclaw/tools/node-current/bin:\$HOME/.openclaw/bin:\$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 OPENCLAW_VERSION=$version_q
 OPENCLAW_POST_INSTALL_COMMANDS=$post_install_q
+swap_size=$swap_q
 model_json=$model_json_q
 auth_json=$auth_json_q
 port=$port
@@ -540,6 +545,32 @@ cat > "\$HOME/.openclaw/openclaw.json" <<JSON
 }
 JSON
 
+if [[ -n "\$swap_size" ]]; then
+  swapfile="/swapfile"
+  if [[ -f "\$swapfile" ]]; then
+    current="\$(sudo du -b "\$swapfile" 2>/dev/null | awk '{print \$1}')"
+    target="\$(numfmt --from=iec "\$swap_size" 2>/dev/null || echo 0)"
+    if [[ "\$current" -ne "\$target" ]]; then
+      sudo swapoff "\$swapfile" 2>/dev/null || true
+      sudo rm -f "\$swapfile"
+    fi
+  fi
+  if [[ ! -f "\$swapfile" ]]; then
+    log() { printf '[lima-claw] %s\n' "\$*"; }
+    log "creating swapfile (swap_size=\$swap_size)"
+    sudo dd if=/dev/zero of="\$swapfile" bs=1M count="\$(numfmt --from=iec "\$swap_size" | awk '{printf "%d\n", \$1/1048576}')" status=progress
+    sudo chmod 600 "\$swapfile"
+    sudo mkswap "\$swapfile"
+  fi
+  if ! grep -qs "\$swapfile" /proc/swaps; then
+    sudo swapon "\$swapfile"
+  fi
+  if ! grep -qs "\$swapfile" /etc/fstab; then
+    echo "\$swapfile none swap sw 0 0" | sudo tee -a /etc/fstab >/dev/null
+  fi
+  log "swap: \$(free -h | awk '/Swap:/{print \$2}')"
+fi
+
 openclaw --version
 
 if [[ -n "\$OPENCLAW_POST_INSTALL_COMMANDS" ]]; then
@@ -578,7 +609,32 @@ if [[ -s "\$pid_file" ]] && kill -0 "\$(cat "\$pid_file")" 2>/dev/null; then
   done
 fi
 
-nohup openclaw gateway --port "$port" --verbose >"\$HOME/.openclaw/logs/gateway-$port.log" 2>&1 &
+nohup bash -c '
+  max_restarts=5
+  window_sec=60
+  count=0
+  first_ts=0
+  while true; do
+    openclaw gateway --port "'"$port"'" --verbose
+    exit_code=\$?
+    now=\$EPOCHSECONDS
+    if [[ \$first_ts -eq 0 ]]; then
+      first_ts=\$now
+      count=1
+    elif [[ \$((now - first_ts)) -le \$window_sec ]]; then
+      count=\$((count + 1))
+    else
+      count=1
+      first_ts=\$now
+    fi
+    if [[ \$count -gt \$max_restarts ]]; then
+      echo "gateway crashed \${count} times within \${window_sec}s, giving up" >&2
+      exit 1
+    fi
+    echo "gateway exited (code=\$exit_code), restarting in 3s... (attempt \${count}/\${max_restarts} within rolling \${window_sec}s window)" >&2
+    sleep 3
+  done
+' >>"\$HOME/.openclaw/logs/gateway-$port.log" 2>&1 &
 printf '%s\n' "\$!" > "\$pid_file"
 EOF
 }
